@@ -22,6 +22,7 @@ import java.util.Optional;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -35,10 +36,15 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  *   Uptime: {@code GetTickCount64}. Clock: {@code CallNtPowerInformation(ProcessorInformation)}.</li>
  *   <li>Physical cores: {@code GetLogicalProcessorInformation} (RelationProcessorCore count).</li>
  *   <li>Volumes: {@code GetVolumeInformationW} for label and filesystem.</li>
+ *   <li>Thermal: {@code \Thermal Zone Information(*)\Temperature} via
+ *   {@code PdhAddEnglishCounter} (language-neutral), then the LibreHardwareMonitor /
+ *   OpenHardwareMonitor WMI namespaces, then {@code MSAcpi_ThermalZoneTemperature} — the
+ *   last two go through PowerShell, refreshed every ten seconds, and the ACPI one needs
+ *   administrator on most boxes.</li>
  * </ul>
  * Disk counters are not exposed: {@code IOCTL_DISK_PERFORMANCE} needs admin and
  * PDH counter names are localized, so {@link #diskIoCounters()} stays empty in
- * this version. Thermal zones need WMI — also left out.
+ * this version.
  */
 final class WindowsFfm implements SystemInfoProvider {
 
@@ -297,7 +303,205 @@ final class WindowsFfm implements SystemInfoProvider {
 
     @Override
     public List<ThermalSensor> thermal() {
+
+        List<ThermalSensor> zones = pdhThermal();
+        return zones.isEmpty() ? wmiThermal() : zones;
+
+    }
+
+    // ---- temperatura -------------------------------------------------------
+
+    private static final int PDH_FMT_DOUBLE = 0x00000200;
+    private static final long PDH_MORE_DATA = 0x800007D2L;
+    /** LPWSTR nombre (8) + CStatus/padding (8) + double (8) en x64. */
+    private static final int PDH_ITEM_BYTES = 24;
+    /** Las muestras por WMI se recalientan cada este tiempo: el spawn de PowerShell cuesta ~300 ms. */
+    private static final long WMI_REFRESH_MILLIS = 10_000;
+
+    private MethodHandle pdhOpen, pdhAddEnglish, pdhCollect, pdhFormatArray;
+    private MemorySegment pdhQuery = MemorySegment.NULL;
+    private MemorySegment pdhCounter = MemorySegment.NULL;
+    private boolean pdhTried;
+    /** 0 sin probar · 1 monitor de hardware · 2 zona ACPI · -1 ninguna vía disponible. */
+    private int wmiProbe;
+    private List<ThermalSensor> wmiSensors = List.of();
+    private long wmiNextProbeMillis;
+
+    /**
+     * El contador de zona térmica solo existe en equipos con zonas ACPI registradas
+     * (aquí hace falta PdhAddEnglishCounter porque los nombres están localizados).
+     */
+    private List<ThermalSensor> pdhThermal() {
+
+        if (!pdhTried) {
+            pdhTried = true;
+            openPdhQuery();
+        }
+        if (pdhCounter == MemorySegment.NULL || pdhCollect == null) {
+            return List.of();
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            if ((int) pdhCollect.invokeExact(pdhQuery) != 0) return List.of();
+            MemorySegment size = arena.allocate(JAVA_INT);
+            MemorySegment count = arena.allocate(JAVA_INT);
+            int status = (int) pdhFormatArray.invokeExact(pdhCounter, PDH_FMT_DOUBLE, size, count, MemorySegment.NULL);
+            if ((status & 0xFFFFFFFFL) != PDH_MORE_DATA) return List.of();
+            MemorySegment items = arena.allocate(size.get(JAVA_INT, 0));
+            status = (int) pdhFormatArray.invokeExact(pdhCounter, PDH_FMT_DOUBLE, size, count, items);
+            if (status != 0) return List.of();
+            List<ThermalSensor> zones = new ArrayList<>();
+            int n = count.get(JAVA_INT, 0);
+            for (int i = 0; i < n; i++) {
+                MemorySegment item = items.asSlice((long) i * PDH_ITEM_BYTES, PDH_ITEM_BYTES);
+                if (item.get(JAVA_INT, 8) != 0) continue; // CStatus: solo lecturas correctas
+                String name = item.get(ADDRESS, 0).reinterpret(256)
+                        .getString(0, StandardCharsets.UTF_16LE);
+                zones.add(new ThermalSensor(
+                        name.isBlank() ? "Thermal zone" : name.trim(),
+                        toCelsius(item.get(JAVA_DOUBLE, 16))));
+            }
+            return zones;
+        } catch (Throwable t) {
+            return List.of();
+        }
+
+    }
+
+    private void openPdhQuery() {
+
+        pdhOpen = handle("pdh", "PdhOpenQueryW",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS));
+        pdhAddEnglish = handle("pdh", "PdhAddEnglishCounterW",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS));
+        pdhCollect = handle("pdh", "PdhCollectQueryData",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS));
+        pdhFormatArray = handle("pdh", "PdhGetFormattedCounterArrayW",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+        if (pdhOpen == null || pdhAddEnglish == null || pdhCollect == null || pdhFormatArray == null) {
+            return;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment queryOut = arena.allocate(ADDRESS);
+            if ((int) pdhOpen.invokeExact(MemorySegment.NULL, 0L, queryOut) != 0) return;
+            pdhQuery = queryOut.get(ADDRESS, 0);
+            MemorySegment counterOut = arena.allocate(ADDRESS);
+            if ((int) pdhAddEnglish.invokeExact(pdhQuery,
+                    wide(arena, "\\Thermal Zone Information(*)\\Temperature"), 0L, counterOut) != 0) return;
+            pdhCounter = counterOut.get(ADDRESS, 0);
+        } catch (Throwable t) {
+            pdhQuery = pdhCounter = MemorySegment.NULL;
+        }
+
+    }
+
+    /**
+     * Sin contador PDH queda WMI: primero los namespaces que publican
+     * LibreHardwareMonitor u OpenHardwareMonitor si corren (sensores con nombre, sin
+     * admin), y si no, la zona térmica ACPI que solo responde con privilegios. La
+     * vía que funcione se refresca cada {@value #WMI_REFRESH_MILLIS} ms; si ninguna
+     * responde se deja de lanzar PowerShell hasta el próximo arranque.
+     */
+    private List<ThermalSensor> wmiThermal() {
+
+        long now = System.currentTimeMillis();
+        if (wmiProbe != 0 && now < wmiNextProbeMillis) {
+            return wmiSensors;
+        }
+        List<ThermalSensor> fresh = switch (wmiProbe) {
+            case 0 -> firstWmiProbe();
+            case 1 -> monitorSensors();
+            default -> acpiSensors();
+        };
+        wmiNextProbeMillis = now + WMI_REFRESH_MILLIS;
+        if (!fresh.isEmpty()) wmiSensors = fresh; // ante un fallo puntual se conserva lo último
+        return wmiSensors;
+
+    }
+
+    private List<ThermalSensor> firstWmiProbe() {
+
+        List<ThermalSensor> found = monitorSensors();
+        if (!found.isEmpty()) {
+            wmiProbe = 1;
+            return found;
+        }
+        found = acpiSensors();
+        if (!found.isEmpty()) {
+            wmiProbe = 2;
+            return found;
+        }
+        wmiProbe = -1;
         return List.of();
+
+    }
+
+    /** Sensores de temperatura de LibreHardwareMonitor u OpenHardwareMonitor si alguno corre. */
+    private static List<ThermalSensor> monitorSensors() {
+
+        String out = Shell.output(8, "powershell", "-NoProfile", "-Command",
+                "'LibreHardwareMonitor','OpenHardwareMonitor' | ForEach-Object { "
+                        + "Get-CimInstance -Namespace ('root/' + $_) -Class Sensor -ErrorAction SilentlyContinue } "
+                        + "| Where-Object SensorType -eq 'Temperature' "
+                        + "| ForEach-Object { $_.Name + '|' + $_.Value.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) }");
+        return parsePipeSensors(out);
+
+    }
+
+    /** Líneas «nombre|valor» con punto decimal (invariante). */
+    static List<ThermalSensor> parsePipeSensors(String out) {
+
+        if (out == null) return List.of();
+        List<ThermalSensor> sensors = new ArrayList<>();
+        for (String line : out.split("\n")) {
+            String[] parts = line.trim().split("\\|");
+            if (parts.length < 2) continue;
+            try {
+                sensors.add(new ThermalSensor(parts[0].trim(), Double.parseDouble(parts[1].trim())));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return sensors;
+
+    }
+
+    /** Zonas térmicas ACPI por WMI: CurrentTemperature llega en décimas de Kelvin. */
+    private static List<ThermalSensor> acpiSensors() {
+
+        String out = Shell.output(8, "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue "
+                        + "| ForEach-Object { $_.InstanceName + '|' + $_.CurrentTemperature }");
+        return parseAcpiZones(out);
+
+    }
+
+    /** Líneas «instancia|décimas-de-kelvin»; el nombre queda en su último segmento. */
+    static List<ThermalSensor> parseAcpiZones(String out) {
+
+        if (out == null) return List.of();
+        List<ThermalSensor> sensors = new ArrayList<>();
+        for (String line : out.split("\n")) {
+            String[] parts = line.trim().split("\\|");
+            if (parts.length < 2) continue;
+            try {
+                String name = parts[0].trim();
+                int sep = name.lastIndexOf('\\');
+                if (sep >= 0) name = name.substring(sep + 1);
+                sensors.add(new ThermalSensor(name.isBlank() ? "ACPI" : name,
+                        Double.parseDouble(parts[1].trim()) / 10 - 273.15));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return sensors;
+
+    }
+
+    /** El dato puede venir en °C, en Kelvin o en décimas de Kelvin según la fuente. */
+    private static double toCelsius(double raw) {
+
+        if (raw > 600) return raw / 10 - 273.15;
+        if (raw > 150) return raw - 273.15;
+        return raw;
+
     }
 
     private static MemorySegment wide(Arena arena, String text) {

@@ -25,7 +25,12 @@
 | Disk I/O | — | `iostat -c 2` | `/proc/diskstats` |
 | Battery | `GetSystemPowerStatus` | `pmset -g batt` | `/sys/class/power_supply` |
 | Uptime | `GetTickCount64` | `kern.boottime` | `/proc/uptime` |
-| Temperatures | — | — | `/sys/class/thermal` |
+| Temperatures | PDH thermal-zone counter → LibreHardwareMonitor/OpenHardwareMonitor WMI → `MSAcpi_ThermalZoneTemperature` (needs admin) | — | `/sys/class/thermal` |
+
+On Windows the thermal sources are probed in order once, then refreshed every ten seconds:
+the PDH counter `PdhAddEnglishCounter` keeps the path language-neutral; the hardware-monitor
+namespaces only exist while those apps run; the ACPI zone answers only for elevated processes
+on machines whose firmware fills it. Boxes with none of them get an empty list.
 
 On Windows the native calls go through the foreign-function API — no native library ships — so run
 with `--enable-native-access=SystemInfoUtils` (like `NetworkUtils`'s `TrafficMonitor`).

@@ -6,7 +6,7 @@
 
     <groupId>io.github.blacknoize404</groupId>
     <artifactId>SystemInfoUtils</artifactId>
-    <version>0.1.0-RELEASE</version>
+    <version>0.1.1-RELEASE</version>
     <packaging>jar</packaging>
     <name>System Info Utils</name>
     <description>Información del computador en tiempo real: CPU, memoria, discos, batería y sensores, en Windows, macOS y Linux.</description>
